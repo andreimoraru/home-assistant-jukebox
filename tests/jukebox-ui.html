@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>jukebox-card { display: block; width: 240px; } ha-card { display: block; }</style>
+<pre id="result">RUNNING</pre>
+<script type="module">
+try {
+    await import('../jukebox-card.js');
+    const assert = (condition, message) => { if (!condition) throw new Error(message); };
+    const kitchen = 'media_player.kitchen';
+    const study = 'media_player.study';
+    const missing = 'media_player.missing';
+    const url = 'http://example.test/radio';
+    const links = [
+        { name: 'My First Station', url, media_content_type: 'audio/mpeg', stream_type: 'BUFFERED' },
+        { name: 'Another Radio Station', url: 'http://example.test/other' },
+        { name: 'A Third Station', url: 'http://example.test/third' },
+    ];
+    const states = {
+        [kitchen]: { state: 'idle', attributes: { friendly_name: 'Kitchen', volume_level: 0.2, is_volume_muted: true } },
+        [study]: { state: 'playing', attributes: { friendly_name: 'Study', volume_level: 0.65, is_volume_muted: false, media_content_id: url } },
+    };
+    const calls = [];
+    const hass = { states, callService(domain, service, data) {
+        calls.push({ domain, service, ...data });
+    }};
+    function mount(entities) {
+        const card = document.createElement('jukebox-card');
+        card.setConfig({ type: 'custom:jukebox-card', entities, links });
+        document.body.append(card);
+        card.hass = hass;
+        return card;
+    }
+    const card = mount([missing, kitchen, study]);
+    const [a, b] = card.querySelectorAll('.speaker-list button');
+    const [station, other] = card.querySelectorAll('.station-list button');
+    const [mute, stop] = card.querySelectorAll('ha-icon-button');
+    const range = card.querySelector('input[type=range]');
+    const pressed = button => button.getAttribute('aria-pressed') === 'true';
+    assert(a instanceof HTMLButtonElement && b instanceof HTMLButtonElement && station instanceof HTMLButtonElement, 'UI-1 native controls render');
+    assert(a.tabIndex === 0 && b.tabIndex === 0 && station.tabIndex === 0, 'UI-1 controls are keyboard focusable');
+    assert(pressed(b) && !pressed(a), 'UI-2 initial playing speaker skips missing entity');
+    assert(pressed(station) && !pressed(other), 'UI-3 playing station marked');
+    assert(other.offsetTop > station.offsetTop, 'UI-3 stations wrap at narrow width');
+    assert(parseFloat(getComputedStyle(station).borderTopWidth) > 0, 'UI-3 station has visible boundary');
+    assert(range.value === '65' && !stop.hasAttribute('disabled') && !range.disabled, 'UI-5 study controls reflect playing state');
+    a.click();
+    assert(pressed(a) && !pressed(b) && !pressed(station), 'UI-1/UI-3 speaker change updates indicators');
+    assert(range.value === '20' && range.disabled && stop.hasAttribute('disabled'), 'UI-5 kitchen mute and idle state');
+    mute.click();
+    assert(calls.at(-1).service === 'volume_mute' && calls.at(-1).entity_id === kitchen && calls.at(-1).is_volume_muted === false, 'UI-5 mute sends correct request');
+    states[kitchen].attributes.is_volume_muted = false;
+    card.hass = hass;
+    range.value = 37;
+    range.dispatchEvent(new Event('change'));
+    assert(calls.filter(call => call.service === 'volume_set').length === 1 && calls.at(-1).volume_level === 0.37 && calls.at(-1).entity_id === kitchen, 'UI-5 correct volume request');
+    b.click();
+    stop.click();
+    assert(calls.at(-1).service === 'media_stop' && calls.at(-1).entity_id === study, 'UI-5 stop sends correct request');
+    a.click();
+    calls.length = 0;
+    station.click();
+    b.click();
+    states[kitchen].state = 'playing';
+    states[kitchen].attributes.media_content_id = url;
+    card.hass = hass;
+    await new Promise(resolve => setTimeout(resolve, 1700));
+    const [play, ...followups] = calls;
+    assert(play.domain === 'media_player' && play.service === 'play_media' && play.entity_id === kitchen && play.media_content_id === url && play.media_content_type === 'audio/mpeg' && play.extra.stream_type === 'BUFFERED' && play.extra.title === 'My First Station', 'UI-4 configured playback metadata');
+    assert(followups.length === 51 && followups.every(call => call.service === 'media_play' && call.entity_id === kitchen), 'UI-4 all Chromecast retries stay on original speaker');
+    other.click();
+    const defaultPlay = calls.find(call => call.service === 'play_media' && call.entity_id === study);
+    assert(defaultPlay.media_content_type === 'music' && defaultPlay.extra.stream_type === 'LIVE', 'UI-4 playback defaults');
+    states[study].state = 'idle';
+    card.hass = hass;
+    assert(!pressed(station) && !pressed(other), 'UI-3 state update clears playing indicator');
+    states[kitchen].state = 'idle';
+    assert(pressed(mount([missing, kitchen, study]).querySelector('.speaker-list button')), 'UI-2 first present speaker fallback');
+    const empty = mount([missing]);
+    const emptyStation = empty.querySelector('.station-list button');
+    const previousCalls = calls.length;
+    emptyStation.click();
+    assert(emptyStation.disabled && empty.querySelector('.volume').hidden && calls.length === previousCalls, 'UI-2 no speaker cannot issue commands');
+    document.querySelector('#result').textContent = 'PASS UI-1 through UI-5 browser fixture';
+} catch (error) {
+    document.querySelector('#result').textContent = 'FAIL ' + error.message;
+}
+</script>
