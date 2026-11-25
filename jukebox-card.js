@@ -22,24 +22,28 @@ class JukeboxCard extends HTMLElement {
     }
 
     buildSpeakerSwitches(hass) {
-        this._tabs = document.createElement('paper-tabs');
-        this._tabs.setAttribute('scrollable', true);
-        this._tabs.addEventListener('iron-activate', (e) => this.onSpeakerSelect(e.detail.item.entityId));
+        const speakers = document.createElement('div');
+        speakers.className = 'speaker-list';
+        speakers.setAttribute('role', 'group');
+        speakers.setAttribute('aria-label', 'Speakers');
+        this._speakerButtons = [];
 
         this.config.entities.forEach(entityId => {
             if (!hass.states[entityId]) {
                 console.log('Jukebox: No State for entity', entityId);
                 return;
             }
-            this._tabs.appendChild(this.buildSpeakerSwitch(entityId, hass));
+            const button = this.buildSpeakerSwitch(entityId, hass);
+            this._speakerButtons.push(button);
+            speakers.appendChild(button);
         });
 
         // automatically activate the first speaker that's playing
-        const firstPlayingSpeakerIndex = this.findFirstPlayingIndex(hass);
-        this._selectedSpeaker = this.config.entities[firstPlayingSpeakerIndex];
-        this._tabs.setAttribute('selected', firstPlayingSpeakerIndex);
+        const playingSpeaker = this._speakerButtons.find(button => hass.states[button.entityId].state === 'playing');
+        this._selectedSpeaker = (playingSpeaker || this._speakerButtons[0])?.entityId;
+        this.updateSpeakerSelection();
 
-        return this._tabs;
+        return speakers;
     }
 
     buildStationList() {
@@ -62,9 +66,10 @@ class JukeboxCard extends HTMLElement {
 
     buildVolumeSlider() {
         const volumeContainer = document.createElement('div');
-        volumeContainer.className = 'volume center horizontal layout';
+        volumeContainer.className = 'volume';
 
         const muteButton = document.createElement('ha-icon-button');
+        muteButton.label = 'Mute';
         muteButton.isMute = false;
         muteButton.addEventListener('click', this.onMuteUnmute.bind(this));
 
@@ -72,13 +77,16 @@ class JukeboxCard extends HTMLElement {
         haIconMute.icon = 'hass:volume-high';
         muteButton.appendChild(haIconMute);
 
-        const slider = document.createElement('ha-slider');
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.setAttribute('aria-label', 'Volume');
         slider.min = 0;
         slider.max = 100;
         slider.addEventListener('change', this.onChangeVolumeSlider.bind(this));
-        slider.className = 'flex';
+        slider.className = 'volume-slider';
 
         const stopButton = document.createElement('ha-icon-button')
+        stopButton.label = 'Stop';
         stopButton.setAttribute('disabled', true);
         stopButton.addEventListener('click', this.onStop.bind(this));
 
@@ -87,10 +95,10 @@ class JukeboxCard extends HTMLElement {
         stopButton.appendChild(haIconStop);
 
         this._hassObservers.push(hass => {
-            if (!this._selectedSpeaker || !hass.states[this._selectedSpeaker]) {
-                return;
-            }
-            const speakerState = hass.states[this._selectedSpeaker].attributes;
+            const entity = hass.states[this._selectedSpeaker];
+            volumeContainer.hidden = !entity;
+            if (!entity) return;
+            const speakerState = entity.attributes;
 
             // no speaker level? then hide mute button and volume
             if (!speakerState.hasOwnProperty('volume_level')) {
@@ -124,6 +132,7 @@ class JukeboxCard extends HTMLElement {
                 haIconMute.icon = 'hass:volume-high';
                 muteButton.isMute = false;
             }
+            muteButton.label = muteButton.isMute ? 'Unmute' : 'Mute';
         });
 
         volumeContainer.appendChild(muteButton);
@@ -134,7 +143,14 @@ class JukeboxCard extends HTMLElement {
 
     onSpeakerSelect(entityId) {
         this._selectedSpeaker = entityId;
+        this.updateSpeakerSelection();
         this._hassObservers.forEach(listener => listener(this.hass));
+    }
+
+    updateSpeakerSelection() {
+        this._speakerButtons.forEach(button => {
+            button.setAttribute('aria-pressed', String(button.entityId === this._selectedSpeaker));
+        });
     }
 
     onChangeVolumeSlider(e) {
@@ -165,28 +181,28 @@ class JukeboxCard extends HTMLElement {
         }
 
         this._stationButtons.forEach(stationSwitch => {
-            if (stationSwitch.hasAttribute('raised') && stationSwitch.stationUrl !== playingUrl) {
-                stationSwitch.removeAttribute('raised');
-                return;
-            }
-            if (!stationSwitch.hasAttribute('raised') && stationSwitch.stationUrl === playingUrl) {
-                stationSwitch.setAttribute('raised', true);
-            }
-        })
+            stationSwitch.disabled = !hass.states[selectedSpeaker];
+            stationSwitch.setAttribute('aria-pressed', String(stationSwitch.stationUrl === playingUrl));
+        });
     }
 
     buildStationSwitch(name, url, media_content_type='music', stream_type='LIVE') {
-        const btn = document.createElement('mwc-button');
+        const btn = document.createElement('button');
+        btn.type = 'button';
         btn.stationUrl = url;
+        btn.stationName = name;
         btn.stationMediaContentType = media_content_type;
         btn.stationStreamType = stream_type;
         btn.className = 'juke-toggle';
-        btn.innerText = name;
+        btn.textContent = name;
         btn.addEventListener('click', this.onStationSelect.bind(this));
         return btn;
     }
 
     async onStationSelect(e) {
+        const speaker = this._selectedSpeaker;
+        if (!this.hass.states[speaker]) return;
+
         /** simple sleep() function as per https://blog.devgenius.io/how-to-make-javascript-sleep-or-wait-d95d33c99909 */
         const sleepNow = (delay) => new Promise((resolve) => setTimeout(resolve, delay));
 
@@ -194,21 +210,21 @@ class JukeboxCard extends HTMLElement {
          * 1) setting state field with idle value
         */
 
-        if(this.hass.states[this._selectedSpeaker].state === 'playing' && this.hass.states[this._selectedSpeaker].attributes.media_content_id === e.currentTarget.stationUrl){
-            this.hass.states[this._selectedSpeaker].state = "idle"
+        if(this.hass.states[speaker].state === 'playing' && this.hass.states[speaker].attributes.media_content_id === e.currentTarget.stationUrl){
+            this.hass.states[speaker].state = "idle"
         }
 
         /** set a variable to use as a timestamp to compute later the time spend on getting the Chromecast from non-playing state to playing state */
         var startTime = Date.now();
         
         this.hass.callService('media_player', 'play_media', {
-            entity_id: this._selectedSpeaker,
+            entity_id: speaker,
             media_content_id: e.currentTarget.stationUrl,
             /* media_content_type: 'audio/mpeg' */
             media_content_type: e.currentTarget.stationMediaContentType,
             extra: {
                 stream_type: e.currentTarget.stationStreamType,
-                title: e.currentTarget.innerText
+                title: e.currentTarget.stationName
             }
         });
 
@@ -234,15 +250,16 @@ class JukeboxCard extends HTMLElement {
          * 4) In case the Chromecast reports back a playing state, then a message is logged at the developers tools console
          *    Example: playing [MD] MAESTRO FM http://192.168.1.20:8000/md.maestrofm
         */
-        while ((this.hass.states[this._selectedSpeaker].state !== 'playing' || this.hass.states[this._selectedSpeaker].attributes.media_content_id !== stationUrl) && Date.now() - startTime < idleTimeout) {
+        while (this.hass.states[speaker] && (this.hass.states[speaker].state !== 'playing' || this.hass.states[speaker].attributes.media_content_id !== stationUrl) && Date.now() - startTime < idleTimeout) {
             this.hass.callService('media_player', 'media_play', {
-                entity_id: this._selectedSpeaker
+                entity_id: speaker
             });
 
             await sleepNow(playFrequency);
             
-            if (this.hass.states[this._selectedSpeaker].state === 'playing' && this.hass.states[this._selectedSpeaker].attributes.media_content_id === stationUrl) {
-                console.log(this.hass.states[this._selectedSpeaker].state, this.hass.states[this._selectedSpeaker].attributes.media_title, this.hass.states[this._selectedSpeaker].attributes.media_content_id, "after", (Date.now() - startTime)/1000, "seconds");
+            const state = this.hass.states[speaker];
+            if (state?.state === 'playing' && state.attributes.media_content_id === stationUrl) {
+                console.log(state.state, state.attributes.media_title, state.attributes.media_content_id, "after", (Date.now() - startTime)/1000, "seconds");
             }
         }
 
@@ -251,8 +268,9 @@ class JukeboxCard extends HTMLElement {
         */
          for (var i = 1; i <= playTimeout; ++i) {
             await sleepNow(i);
+            if (!this.hass.states[speaker]) return;
             this.hass.callService('media_player', 'media_play', {
-                entity_id: this._selectedSpeaker
+                entity_id: speaker
             });
         }
     }
@@ -264,25 +282,12 @@ class JukeboxCard extends HTMLElement {
         });
     }
 
-    /***
-     * returns the numeric index of the first entity in a "Playing" state, or 0 (first index).
-     *
-     * @param hass
-     * @returns {number}
-     * @private
-     */
-    findFirstPlayingIndex(hass) {
-        return Math.max(0, this.config.entities.findIndex(entityId => {
-            return hass.states[entityId] && hass.states[entityId].state === 'playing';
-        }));
-    }
-
     buildSpeakerSwitch(entityId, hass) {
-        const entity = hass.states[entityId];
-
-        const btn = document.createElement('paper-tab');
-        btn.entityId = entityId;        
-        btn.innerText = hass.states[entityId].attributes.friendly_name;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.entityId = entityId;
+        btn.textContent = hass.states[entityId].attributes.friendly_name || entityId;
+        btn.addEventListener('click', () => this.onSpeakerSelect(entityId));
         return btn;
     }
 
@@ -299,68 +304,82 @@ class JukeboxCard extends HTMLElement {
 }
 
 function getStyle() {
-    const frag = document.createDocumentFragment();
-
-    const included = document.createElement('style');
-    included.setAttribute('include', 'iron-flex iron-flex-alignment');
-
-    const ownStyle = document.createElement('style');
-    ownStyle.innerHTML = `
-    .layout.horizontal, .layout.vertical {
-        display: -ms-flexbox;
-        display: -webkit-flex;
-        display: flex;
-    }
-    
-    .layout.horizontal {
-        -ms-flex-direction: row;
-        -webkit-flex-direction: row;
-        flex-direction: row;
-    }
-    
-    .layout.center, .layout.center-center {
-        -ms-flex-align: center;
-        -webkit-align-items: center;
-        align-items: center;
-    }
-    
-    .flex {
-        ms-flex: 1 1 0.000000001px;
-        -webkit-flex: 1;
-        flex: 1;
-        -webkit-flex-basis: 0.000000001px;
-        flex-basis: 0.000000001px;
-    }
-    
-    [hidden] {
+    const style = document.createElement('style');
+    style.textContent = `
+    jukebox-card [hidden] {
         display: none !important;
     }
-    
-    .volume {
+
+    jukebox-card .volume {
+        display: flex;
+        align-items: center;
+        gap: 8px;
         padding: 10px 20px;
     }
-    
-    mwc-button.juke-toggle {
-        --mdc-theme-primary: var(--primary-text-color);
-    }
-    
-    mwc-button.juke-toggle[raised] {
-        --mdc-theme-primary: var(--primary-color);
-        background-color: var(--primary-color);
-        color: var(--text-primary-color);
-    }
-    
-    paper-tabs {
-        background-color: var(--primary-color);
-        color: var(--text-primary-color);
-        --paper-tabs-selection-bar-color: var(--text-primary-color, #FFF);
-    }
-            
-    `;
 
-    frag.appendChild(included);
-    frag.appendChild(ownStyle);
-    return frag;
+    jukebox-card .volume-slider {
+        flex: 1;
+        min-width: 0;
+        accent-color: var(--primary-color, #03a9f4);
+    }
+
+    jukebox-card .speaker-list,
+    jukebox-card .station-list {
+        display: flex;
+        gap: 6px;
+        padding: 8px;
+    }
+
+    jukebox-card .speaker-list {
+        overflow-x: auto;
+        border-bottom: 1px solid var(--divider-color, #aaa);
+    }
+
+    jukebox-card .station-list {
+        flex-wrap: wrap;
+    }
+
+    jukebox-card .speaker-list button,
+    jukebox-card .station-list button {
+        box-sizing: border-box;
+        min-height: 36px;
+        padding: 6px 12px;
+        border: 1px solid var(--divider-color, #aaa);
+        border-radius: 6px;
+        background: var(--ha-card-background, var(--card-background-color, transparent));
+        color: var(--primary-text-color, inherit);
+        font: inherit;
+        cursor: pointer;
+    }
+
+    jukebox-card .speaker-list button {
+        flex: none;
+        white-space: nowrap;
+    }
+
+    jukebox-card .station-list button {
+        max-width: 100%;
+        overflow-wrap: anywhere;
+    }
+
+    jukebox-card .speaker-list button[aria-pressed='true'],
+    jukebox-card .station-list button[aria-pressed='true'] {
+        border-color: var(--primary-color, #03a9f4);
+        box-shadow: inset 0 -3px var(--primary-color, #03a9f4);
+    }
+
+    jukebox-card .speaker-list button:focus-visible,
+    jukebox-card .station-list button:focus-visible {
+        outline: 2px solid var(--primary-color, #03a9f4);
+        outline-offset: 2px;
+    }
+
+    jukebox-card .station-list button:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+    `;
+    return style;
 }
 
 customElements.define('jukebox-card', JukeboxCard);
