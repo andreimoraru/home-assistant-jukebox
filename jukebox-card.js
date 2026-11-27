@@ -1,4 +1,15 @@
+const CONNECTION_LOST_MESSAGE = 'Connection to Home Assistant lost. Select a station again after reconnecting.';
+const STARTUP_RETRY_INTERVAL_MS = 100;
+const STARTUP_RETRY_WINDOW_MS = 15000;
+const FOLLOW_UP_RETRY_LIMIT = 50;
+const FOLLOW_UP_RETRY_WINDOW_MS = 5000;
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 class JukeboxCard extends HTMLElement {
+    _playbackAttempts = new Map();
+    _connectionRevision = 0;
+
     set hass(hass) {
         if (!this.content) {
             this._hassObservers = [];
@@ -9,16 +20,69 @@ class JukeboxCard extends HTMLElement {
             this.appendChild(card);
 
             this.content.appendChild(this.buildSpeakerSwitches(hass));
+            this._status = document.createElement('div');
+            this._status.className = 'jukebox-status';
+            this._status.setAttribute('role', 'status');
+            this.content.appendChild(this._status);
             this.content.appendChild(this.buildVolumeSlider());
             this.content.appendChild(this.buildStationList());
         }
 
         this._hass = hass;
-        this._hassObservers.forEach(listener => listener(hass));
+        this.syncConnection();
+        for (const speaker of this._playbackAttempts.keys()) {
+            if (!this.isSpeakerAvailable(speaker)) this._playbackAttempts.delete(speaker);
+        }
+        this.refreshControls();
+    }
+
+    disconnectedCallback() {
+        this._playbackAttempts.clear();
+        this._connectionRevision++;
     }
 
     get hass() {
         return this._hass;
+    }
+
+    isOnline() {
+        return this.hass.connected !== false && this.hass.connection?.connected !== false;
+    }
+
+    isSpeakerAvailable(speaker) {
+        const state = this.hass.states[speaker]?.state;
+        return !!state && state !== 'unavailable' && state !== 'unknown';
+    }
+
+    canControl(speaker) {
+        return this.isConnected && this.isOnline() && this.isSpeakerAvailable(speaker);
+    }
+
+    syncConnection() {
+        const online = this.isOnline();
+        if (online !== this._online) {
+            this._connectionRevision++;
+            this._actionError = '';
+            this._online = online;
+        }
+        if (!online) this._playbackAttempts.clear();
+    }
+
+    refreshControls() {
+        this._hassObservers.forEach(listener => listener(this.hass));
+        const message = this.isOnline() ? this._actionError || '' : CONNECTION_LOST_MESSAGE;
+        if (this._status.textContent !== message) this._status.textContent = message;
+    }
+
+    callMediaService(service, data) {
+        // This card owns the error message, including errors from internal retries.
+        return this.hass.callService('media_player', service, data, undefined, false);
+    }
+
+    showActionError(message) {
+        this.syncConnection();
+        if (this.isOnline()) this._actionError = message;
+        this.refreshControls();
     }
 
     buildSpeakerSwitches(hass) {
@@ -95,44 +159,27 @@ class JukeboxCard extends HTMLElement {
         stopButton.appendChild(haIconStop);
 
         this._hassObservers.push(hass => {
-            const entity = hass.states[this._selectedSpeaker];
+            const speaker = this._selectedSpeaker;
+            const entity = hass.states[speaker];
+            const attributes = entity?.attributes;
+            const enabled = this.isOnline() && this.isSpeakerAvailable(speaker);
+            const starting = this._playbackAttempts.has(speaker);
+            const hasVolume = Object.hasOwn(attributes ?? {}, 'volume_level');
+            const hasMute = Object.hasOwn(attributes ?? {}, 'is_volume_muted');
+
             volumeContainer.hidden = !entity;
-            if (!entity) return;
-            const speakerState = entity.attributes;
+            slider.hidden = !hasVolume;
+            slider.disabled = !enabled || !hasVolume || !!attributes?.is_volume_muted;
+            slider.value = hasVolume ? attributes.volume_level * 100 : 0;
 
-            // no speaker level? then hide mute button and volume
-            if (!speakerState.hasOwnProperty('volume_level')) {
-                slider.setAttribute('hidden', true);
-                stopButton.setAttribute('hidden', true)
-            } else {
-                slider.removeAttribute('hidden');
-                stopButton.removeAttribute('hidden')
-            }
-
-            if (!speakerState.hasOwnProperty('is_volume_muted')) {
-                muteButton.setAttribute('hidden', true);
-            } else {
-                muteButton.removeAttribute('hidden');
-            }
-
-            if (hass.states[this._selectedSpeaker].state === 'playing') {
-                stopButton.removeAttribute('disabled');
-            } else {
-                stopButton.setAttribute('disabled', true);
-            }
-
-            slider.value = speakerState.volume_level ? speakerState.volume_level * 100 : 0;
-
-            if (speakerState.is_volume_muted && !slider.disabled) {
-                slider.disabled = true;
-                haIconMute.icon = 'hass:volume-off';
-                muteButton.isMute = true;
-            } else if (!speakerState.is_volume_muted && slider.disabled) {
-                slider.disabled = false;
-                haIconMute.icon = 'hass:volume-high';
-                muteButton.isMute = false;
-            }
+            muteButton.toggleAttribute('hidden', !hasMute);
+            muteButton.toggleAttribute('disabled', !enabled || !hasMute);
+            muteButton.isMute = !!attributes?.is_volume_muted;
             muteButton.label = muteButton.isMute ? 'Unmute' : 'Mute';
+            haIconMute.icon = muteButton.isMute ? 'hass:volume-off' : 'hass:volume-high';
+
+            stopButton.toggleAttribute('hidden', !hasVolume && !starting);
+            stopButton.toggleAttribute('disabled', !enabled || (!starting && (!hasVolume || entity.state !== 'playing')));
         });
 
         volumeContainer.appendChild(muteButton);
@@ -144,7 +191,7 @@ class JukeboxCard extends HTMLElement {
     onSpeakerSelect(entityId) {
         this._selectedSpeaker = entityId;
         this.updateSpeakerSelection();
-        this._hassObservers.forEach(listener => listener(this.hass));
+        this.refreshControls();
     }
 
     updateSpeakerSelection() {
@@ -154,22 +201,38 @@ class JukeboxCard extends HTMLElement {
     }
 
     onChangeVolumeSlider(e) {
-        const volPercentage = parseFloat(e.currentTarget.value);
-        const vol = (volPercentage > 0 ? volPercentage / 100 : 0);
-        this.setVolume(vol);
+        if (e.currentTarget.disabled) return;
+        this.runMediaAction('volume_set', {
+            volume_level: Number(e.currentTarget.value) / 100,
+        }, 'Could not set the volume.');
     }
 
     onMuteUnmute(e) {
-        this.hass.callService('media_player', 'volume_mute', {
-            entity_id: this._selectedSpeaker,
-            is_volume_muted: !e.currentTarget.isMute
-        });
+        if (e.currentTarget.hasAttribute('disabled')) return;
+        this.runMediaAction('volume_mute', {
+            is_volume_muted: !e.currentTarget.isMute,
+        }, 'Could not change mute.');
     }
 
     onStop(e) {
-        this.hass.callService('media_player', 'media_stop', {
-            entity_id: this._selectedSpeaker
-        });
+        if (e.currentTarget.hasAttribute('disabled')) return;
+        this._playbackAttempts.delete(this._selectedSpeaker);
+        this.runMediaAction('media_stop', {}, 'Could not stop playback.');
+    }
+
+    async runMediaAction(service, data, errorMessage) {
+        const speaker = this._selectedSpeaker;
+        if (!this.canControl(speaker)) return;
+        const revision = this._connectionRevision;
+        this._actionError = '';
+        this.refreshControls();
+        try {
+            await this.callMediaService(service, { ...data, entity_id: speaker });
+        } catch {
+            if (this.isConnected && this._connectionRevision === revision) {
+                this.showActionError(errorMessage);
+            }
+        }
     }
 
     updateStationSwitchStates(hass) {
@@ -181,7 +244,7 @@ class JukeboxCard extends HTMLElement {
         }
 
         this._stationButtons.forEach(stationSwitch => {
-            stationSwitch.disabled = !hass.states[selectedSpeaker];
+            stationSwitch.disabled = !this.isOnline() || !this.isSpeakerAvailable(selectedSpeaker);
             stationSwitch.setAttribute('aria-pressed', String(stationSwitch.stationUrl === playingUrl));
         });
     }
@@ -201,85 +264,53 @@ class JukeboxCard extends HTMLElement {
 
     async onStationSelect(e) {
         const speaker = this._selectedSpeaker;
-        if (!this.hass.states[speaker]) return;
+        if (!this.canControl(speaker)) return;
 
-        /** simple sleep() function as per https://blog.devgenius.io/how-to-make-javascript-sleep-or-wait-d95d33c99909 */
-        const sleepNow = (delay) => new Promise((resolve) => setTimeout(resolve, delay));
+        const { stationUrl, stationName, stationMediaContentType, stationStreamType } = e.currentTarget;
+        const attempt = {};
+        this._playbackAttempts.set(speaker, attempt);
+        this._actionError = '';
+        this.refreshControls();
 
-        /** scenario when you hit on hit one more time on a station that is playing
-         * 1) setting state field with idle value
-        */
-
-        if(this.hass.states[speaker].state === 'playing' && this.hass.states[speaker].attributes.media_content_id === e.currentTarget.stationUrl){
-            this.hass.states[speaker].state = "idle"
-        }
-
-        /** set a variable to use as a timestamp to compute later the time spend on getting the Chromecast from non-playing state to playing state */
-        var startTime = Date.now();
-        
-        this.hass.callService('media_player', 'play_media', {
-            entity_id: speaker,
-            media_content_id: e.currentTarget.stationUrl,
-            /* media_content_type: 'audio/mpeg' */
-            media_content_type: e.currentTarget.stationMediaContentType,
-            extra: {
-                stream_type: e.currentTarget.stationStreamType,
-                title: e.currentTarget.stationName
-            }
-        });
-
-        /* because e.currentTarget is going to be nulled after the Chromecast has state=playing, we need to store the stationUrl in a local variable */
-        var stationUrl = e.currentTarget.stationUrl;
-
-        /** timeout in seconds for waiting for the Chromecast to start playing the media */
-        var playTimeout = 50;
-
-        /** how frequent in miliseconds we should send media_play commands for waiting for the Chromecast to start playing the media */
-        var playFrequency = 100;
-
-        /** timeout in seconds while we send media_play commands when the device reports back as having state not playing */
-        var idleTimeout = 3 * playTimeout * playFrequency;
-        
-        /**Chromecast device has a buffer to fill in before actually playing any content. The loop below is aiming to send  mediap_play command to Chromecast device until it reports its state as playing.
-         * the additional check for media_content_id is required for the scenario when:
-         * 1) Chromecast is playing something and obviously its state is playing.
-         * 2) you try to play something else. Thus we compare the media_content_id value of whatever Chromecast device reports it is playing with the value of media_content_id that we sent it to play.
-         *    If the values are different, then send media_play command repeatedly until Chromecare device reports back a value for media_content_id equal to the one we asked to be played.
-         *    Note that condition that state is playing should be filled first.
-         * 3) Control loop lenght with a safety timeout of idleTimout seconds
-         * 4) In case the Chromecast reports back a playing state, then a message is logged at the developers tools console
-         *    Example: playing [MD] MAESTRO FM http://192.168.1.20:8000/md.maestrofm
-        */
-        while (this.hass.states[speaker] && (this.hass.states[speaker].state !== 'playing' || this.hass.states[speaker].attributes.media_content_id !== stationUrl) && Date.now() - startTime < idleTimeout) {
-            this.hass.callService('media_player', 'media_play', {
-                entity_id: speaker
-            });
-
-            await sleepNow(playFrequency);
-            
+        const isCurrent = () => this._playbackAttempts.get(speaker) === attempt;
+        const canContinue = () => isCurrent() && this.canControl(speaker);
+        const isStationPlaying = () => {
             const state = this.hass.states[speaker];
-            if (state?.state === 'playing' && state.attributes.media_content_id === stationUrl) {
-                console.log(state.state, state.attributes.media_title, state.attributes.media_content_id, "after", (Date.now() - startTime)/1000, "seconds");
+            return state?.state === 'playing' && state.attributes.media_content_id === stationUrl;
+        };
+        // A restart of the same station needs a retry even if the old state still says playing.
+        let restart = isStationPlaying();
+        const startupDeadline = Date.now() + STARTUP_RETRY_WINDOW_MS;
+
+        try {
+            await this.callMediaService('play_media', {
+                entity_id: speaker,
+                media_content_id: stationUrl,
+                media_content_type: stationMediaContentType,
+                extra: { stream_type: stationStreamType, title: stationName },
+            });
+
+            while (canContinue() && Date.now() < startupDeadline && (restart || !isStationPlaying())) {
+                restart = false;
+                await this.callMediaService('media_play', { entity_id: speaker });
+                if (canContinue()) await wait(STARTUP_RETRY_INTERVAL_MS);
+            }
+
+            // Some Chromecast devices report playing before their audio starts.
+            const followUpDeadline = Date.now() + FOLLOW_UP_RETRY_WINDOW_MS;
+            for (let delay = 1; delay <= FOLLOW_UP_RETRY_LIMIT && canContinue(); delay++) {
+                await wait(delay);
+                if (!canContinue() || Date.now() >= followUpDeadline) break;
+                await this.callMediaService('media_play', { entity_id: speaker });
+            }
+        } catch {
+            if (isCurrent()) this.showActionError('Could not start playback. Select a station to try again.');
+        } finally {
+            if (isCurrent()) {
+                this._playbackAttempts.delete(speaker);
+                this.refreshControls();
             }
         }
-
-        /** Loop for sending the media_play command to Chromecast after it is reporting a playing state but doesn't actually play (perhaps the Chromecast device buffer is still filling with media stream data).
-         * By trying figured out the appropriate period to send this commands is about 5 seconds after it reported playing state but is not actually playing.
-        */
-         for (var i = 1; i <= playTimeout; ++i) {
-            await sleepNow(i);
-            if (!this.hass.states[speaker]) return;
-            this.hass.callService('media_player', 'media_play', {
-                entity_id: speaker
-            });
-        }
-    }
-
-    setVolume(value) {
-        this.hass.callService('media_player', 'volume_set', {
-            entity_id: this._selectedSpeaker,
-            volume_level: value
-        });
     }
 
     buildSpeakerSwitch(entityId, hass) {
@@ -308,6 +339,11 @@ function getStyle() {
     style.textContent = `
     jukebox-card [hidden] {
         display: none !important;
+    }
+
+    jukebox-card .jukebox-status:not(:empty) {
+        margin: 8px 12px 0;
+        color: var(--error-color, #d32f2f);
     }
 
     jukebox-card .volume {

@@ -9,7 +9,7 @@ const office = 'media_player.office';
 const firstUrl = 'https://example.test/first';
 const nextUrl = 'https://example.test/next';
 
-function setup(callService) {
+function setup(callService, connected = true) {
     const card = document.createElement('jukebox-card');
     const states = Object.fromEntries([kitchen, office].map(id => [
         id, { state: 'idle', attributes: { friendly_name: id, volume_level: 0.5, is_volume_muted: false } },
@@ -26,7 +26,7 @@ function setup(callService) {
         { name: 'First', url: firstUrl }, { name: 'Next', url: nextUrl },
     ]});
     document.body.append(card);
-    update();
+    update(connected);
     const [first, next] = card.querySelectorAll('.station-list button');
     const [mute, stop] = card.querySelectorAll('ha-icon-button');
     const volume = card.querySelector('input[type="range"]');
@@ -97,6 +97,56 @@ try {
     assert(b.calls.length === 2 && b.card.querySelector('[role="status"]').textContent.includes('mute'),
         'DC-4: mute failure replaces the prior message');
     b.card.remove();
+
+    const offline = setup(undefined, false);
+    assert(offline.first.disabled && offline.volume.disabled &&
+        offline.card.querySelector('[role="status"]').textContent.includes('Connection to Home Assistant lost'),
+        'DC-2: first render offline shows the message and disables commands');
+    offline.card.remove();
+
+    const betweenRetries = setup();
+    betweenRetries.first.click();
+    await until(() => betweenRetries.calls.length === 2, 'startup never reached retry delay');
+    betweenRetries.update(false);
+    betweenRetries.update();
+    await wait(240);
+    assert(betweenRetries.calls.length === 2, 'DC-1/DC-3: a quick reconnect cannot resume sleeping retries');
+    betweenRetries.card.remove();
+
+    let resolveKitchen;
+    const waitingKitchen = new Promise(resolve => { resolveKitchen = resolve; });
+    const c = setup(call => call.data.entity_id === kitchen && call.service === 'play_media' &&
+        call.data.media_content_id === firstUrl ? waitingKitchen : Promise.resolve());
+    c.first.click();
+    assert(!c.stop.hasAttribute('disabled'), 'DC-5: Stop is enabled during initial startup');
+    c.card.querySelectorAll('.speaker-list button')[1].click();
+    c.first.click();
+    await until(() => c.calls.some(call => call.service === 'media_play' && call.data.entity_id === office),
+        'DC-5: office runs independently of pending kitchen startup');
+    c.card.querySelectorAll('.speaker-list button')[0].click();
+    c.next.click();
+    await until(() => c.calls.some(call => call.service === 'media_play' && call.data.entity_id === kitchen),
+        'DC-5: new kitchen station can start');
+    c.stop.click();
+    const kitchenCallCount = () => c.calls.filter(call => call.data.entity_id === kitchen).length;
+    const stoppedAt = kitchenCallCount();
+    assert(c.calls.at(-1).service === 'media_stop', 'DC-5: Stop sends the stop command');
+    resolveKitchen();
+    await wait(240);
+    assert(kitchenCallCount() === stoppedAt, 'DC-5: Stop and station replacement prevent stale retries');
+    c.card.remove();
+    const detachedAt = c.calls.length;
+    await wait(240);
+    assert(c.calls.length === detachedAt, 'DC-5: removing the card prevents further retries');
+
+    const retryFailure = setup(call => call.service === 'media_play'
+        ? Promise.reject(new Error('retry failed')) : Promise.resolve());
+    retryFailure.first.click();
+    await wait(240);
+    assert(retryFailure.calls.length === 2 &&
+        retryFailure.card.querySelector('[role="status"]').textContent.includes('playback'),
+        'DC-4: a retry rejection while connected ends the sequence');
+    retryFailure.card.remove();
     assert(uncaught === 0, 'DC-4: no unhandled service rejection');
     document.querySelector('#result').textContent = 'PASS Jukebox disconnect fixture';
 } catch (error) {
